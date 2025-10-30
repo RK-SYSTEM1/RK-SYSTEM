@@ -1,0 +1,6 @@
+fastapi==0.104.0
+uvicorn[standard]==0.23.2
+python-telegram-bot==20.3
+aiohttp==3.9.4
+psutil==5.9.5
+flask
